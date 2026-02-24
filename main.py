@@ -1,3 +1,4 @@
+# python
 import time
 import math
 import cv2
@@ -5,10 +6,11 @@ from ultralytics import YOLO
 from src.serial_comm import SerialController
 from centroid_tracker import CentroidTracker
 
-CENTER_TOLERANCE = 20  # pixels
-FIRE_COOLDOWN = 2.0    # seconds
-CLEAR_INTERVAL = 10.0  # seconds
-SURVEILLANCE_SPEED = 15  # degrees/second for surveillance sweep
+CENTER_TOLERANCE = 20  # pixels tolerance for considering a target "centered" (for auto-fire) - small to encourage manual firing and prevent accidental shots
+FIRE_COOLDOWN = 2.0    # seconds to cool down between shots (long to encourage manual firing and prevent spam)
+CLEAR_INTERVAL = 1000.0  # seconds to clear neutralized targets (long to keep them out of priority)
+SURVEILLANCE_SPEED = 15  # degrees/second for surveillance sweep slow to allow better target acquisition and reduce CPU load
+DEG_PER_PIXEL = 0.08  # degrees per pixel (Arduino mapping) big enough to cover typical webcam FOV but small enough for fine control
 
 
 def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
@@ -20,8 +22,8 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
     last_fire = 0
     last_clear = time.time()
 
-    # Surveillance mode variables
-    surveillance_pos = 0  # Current servo position (-90 to 90 degrees)
+    # Surveillance mode variables (degrees)
+    surveillance_angle = 0.0  # Current servo angle (-surveillance_range..+surveillance_range)
     surveillance_direction = 1  # 1 for right, -1 for left
     last_surveillance_update = time.time()
     surveillance_range = 90  # Sweep ±90 degrees
@@ -89,72 +91,80 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
         cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)
 
         send_fire = False
-        dx = 0
-        dy = 0
 
         if target:
             # TARGET ACQUISITION MODE
-            score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx, dy = target
-            distance = math.hypot(dx, dy)
+            score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
+            distance = math.hypot(dx_px, dy_px)
             aligned = distance <= CENTER_TOLERANCE
 
             # Draw target
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.circle(frame, (cx_obj, cy_obj), 4, (0, 255, 0), -1)
             cv2.line(frame, (cx, cy), (cx_obj, cy_obj), (255, 0, 0), 1)
-            cv2.putText(frame, f"ID:{oid} | dx={int(dx)} dy={int(dy)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+            cv2.putText(frame, f"ID:{oid} | dx={int(dx_px)} dy={int(dy_px)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (0, 255, 0), 2)
             cv2.putText(frame, "MODE: TARGETING", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (0, 255, 0), 2)
 
-            # Fire when aligned
-            if aligned and (now - last_fire) > FIRE_COOLDOWN:
-                send_fire = True
-                last_fire = now
-                neutralized[oid] = now
+            # convert pixel offsets to degrees for servos
+            dx_deg = dx_px * DEG_PER_PIXEL
+            dy_deg = dy_px * DEG_PER_PIXEL
 
-            # Reset surveillance on target acquisition
-            surveillance_pos = 0
+            # Note: Fire condition checked later after key press detection
+
+            # Reset surveillance on target acquisition to avoid timing jump
+            surveillance_angle = 0.0
             surveillance_direction = 1
+            last_surveillance_update = time.time()
         else:
-            # SURVEILLANCE MODE - slowly sweep when no targets
+            # SURVEILLANCE MODE - sweep at constant degrees/second
+            time.sleep(10 / 1000)  # small delay to reduce CPU load
             cv2.putText(frame, "MODE: SURVEILLANCE", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (0, 165, 255), 2)
 
-            # Update surveillance position at constant speed
             time_delta = time.time() - last_surveillance_update
             if time_delta > 0:
-                # Convert speed (degrees/second) to pixel offset
-                # Using scale from Arduino: 1 pixel = 0.08 degrees
-                # So: degrees/second / 0.08 = pixels/second
-                pixels_per_second = SURVEILLANCE_SPEED / 0.08
-                movement = pixels_per_second * time_delta * surveillance_direction
-
-                surveillance_pos += movement
-
-                # Bounce at limits
-                if surveillance_pos >= surveillance_range:
-                    surveillance_pos = surveillance_range
+                surveillance_angle += SURVEILLANCE_SPEED * time_delta * surveillance_direction
+                if surveillance_angle >= surveillance_range:
+                    surveillance_angle = surveillance_range
                     surveillance_direction = -1
-                elif surveillance_pos <= -surveillance_range:
-                    surveillance_pos = -surveillance_range
+                elif surveillance_angle <= -surveillance_range:
+                    surveillance_angle = -surveillance_range
                     surveillance_direction = 1
-
                 last_surveillance_update = time.time()
 
-            # Convert surveillance position to dx offset for servo
-            dx = int(surveillance_pos)
-            dy = 0
+            dx_deg = surveillance_angle
+            dy_deg = 0.0
 
-            cv2.putText(frame, f"Sweep: {int(surveillance_pos):+d}°", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+            cv2.putText(frame, f"Sweep: {int(surveillance_angle):+d}°", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (0, 165, 255), 2)
 
-        ser.send_aim(int(dx), int(dy), send_fire)
-
+        # Display frame and check for key press
         cv2.imshow('turret', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            print("operator requested shutdown.......")
+            time.sleep(3)
+            print("Terminating program.")
             break
 
+        # Fire logic (only if we have a target)
+        if target:
+            score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
+            distance = math.hypot(dx_px, dy_px)
+            aligned = distance <= CENTER_TOLERANCE
+
+            # Fire when manually triggered with F key OR automatically when aligned
+            if (key == ord('f') or aligned) and (now - last_fire) > FIRE_COOLDOWN:
+                send_fire = True
+                last_fire = now
+                neutralized[oid] = now
+                print(f"🎯 MANUAL FIRE at target ID:{oid}")
+
+        # send aim in degrees (Arduino expects degrees)
+        ser.send_aim(int(round(dx_deg)), int(round(dy_deg)), send_fire)
 
     ser.close()
     cap.release()
@@ -162,5 +172,5 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
 
 
 if __name__ == "__main__":
-    # set `serial_port` to your Arduino COM port like 'COM3' on Windows
+    # set `serial_port` to your Arduino COM port like `COM3` on Windows
     run(camera_index=0, serial_port=None)
