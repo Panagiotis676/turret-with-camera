@@ -1,176 +1,371 @@
-# python
+# python - Turret Main Program (GUI + Async YOLO Stable Version)
 import time
 import math
 import cv2
+import gc
+import sys
+import os
+import threading
+import queue
 from ultralytics import YOLO
-from src.serial_comm import SerialController
+
+# Add parent directory to path so we can import from root
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from serial_comm import SerialController
 from centroid_tracker import CentroidTracker
 
-CENTER_TOLERANCE = 20  # pixels tolerance for considering a target "centered" (for auto-fire) - small to encourage manual firing and prevent accidental shots
-FIRE_COOLDOWN = 2.0    # seconds to cool down between shots (long to encourage manual firing and prevent spam)
-CLEAR_INTERVAL = 1000.0  # seconds to clear neutralized targets (long to keep them out of priority)
-SURVEILLANCE_SPEED = 15  # degrees/second for surveillance sweep slow to allow better target acquisition and reduce CPU load
-DEG_PER_PIXEL = 0.08  # degrees per pixel (Arduino mapping) big enough to cover typical webcam FOV but small enough for fine control
+# Configuration
+CENTER_TOLERANCE = 20
+FIRE_COOLDOWN = 2.0
+CLEAR_INTERVAL = 1000.0
+SURVEILLANCE_SPEED = 15
+DEG_PER_PIXEL = 0.08
+SERIAL_RATE_HZ = 20
+SERIAL_INTERVAL = 1.0 / SERIAL_RATE_HZ
+STATUS_LOG_INTERVAL = 5.0
+
+# Optimization settings
+FRAME_SCALE_WIDTH = 640         # Downscale frames to this width for YOLO
+YOLO_CONFIDENCE = 0.5           # Filter low-confidence detections
+TRACKER_MAX_DISAPPEARED = 10    # Reduce tracker memory pressure
+YOLO_INTERVAL = 1.0             # YOLO cadence in seconds
 
 
 def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
-    model = YOLO(model_path)
-    ser = SerialController(serial_port)
-    tracker = CentroidTracker(max_disappeared=30, max_distance=120)
+    """Main turret control loop with always-on GUI and async YOLO worker."""
 
-    neutralized = {}    # id -> timestamp
-    last_fire = 0
-    last_clear = time.time()
+    # Resolve model path relative to project root when needed.
+    if not os.path.isabs(model_path):
+        candidate_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), model_path)
+        if os.path.exists(candidate_root):
+            model_path = candidate_root
 
-    # Surveillance mode variables (degrees)
-    surveillance_angle = 0.0  # Current servo angle (-surveillance_range..+surveillance_range)
-    surveillance_direction = 1  # 1 for right, -1 for left
-    last_surveillance_update = time.time()
-    surveillance_range = 90  # Sweep ±90 degrees
-
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        print("❌ Cannot open camera")
+    # Initialize components
+    try:
+        model = YOLO(model_path)
+    except Exception as e:
+        print(f"❌ Failed to load YOLO model: {e}")
         return
 
-    print("✅ Webcam started — press Q to quit")
+    try:
+        ser = SerialController(serial_port)
+    except Exception as e:
+        print(f"❌ Failed to initialize serial: {e}")
+        return
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        tracker = CentroidTracker(max_disappeared=TRACKER_MAX_DISAPPEARED, max_distance=120)
+    except Exception as e:
+        print(f"❌ Failed to initialize tracker: {e}")
+        return
 
-        h, w = frame.shape[:2]
-        cx, cy = w // 2, h // 2
+    # State variables
+    neutralized = {}
+    last_fire = 0.0
+    last_clear = time.time()
+    last_serial_send = time.time()
+    last_status_log = time.time()
 
-        # Run YOLO detection
-        results = model(frame, verbose=False)
-        boxes = results[0].boxes
+    surveillance_angle = 0.0
+    surveillance_direction = 1
+    last_surveillance_update = time.time()
+    surveillance_range = 90
 
-        # Extract person detections (class 0)
-        detections = []
-        if boxes is not None:
-            for box, cls in zip(boxes.xyxy, boxes.cls):
-                if int(cls) == 0:
-                    x1, y1, x2, y2 = [int(v) for v in box]
-                    detections.append((x1, y1, x2, y2))
+    # Async YOLO shared state
+    yolo_input_queue = queue.Queue(maxsize=1)
+    yolo_output_queue = queue.Queue(maxsize=1)
+    yolo_stop_event = threading.Event()
+    latest_detections = []  # cached person detections in original frame coords
+    latest_detection_ts = 0.0
 
-        # Update tracker with detections
-        tracked = tracker.update(detections)
-
-        # Periodic clear of neutralized targets
-        now = time.time()
-        if now - last_clear > CLEAR_INTERVAL:
-            neutralized = {oid: ts for oid, ts in neutralized.items() if now - ts < CLEAR_INTERVAL}
-            last_clear = now
-
-        # Prioritize targets: prefer largest and near center
-        candidates = []
-        for oid, (x1, y1, x2, y2, cx_obj, cy_obj) in tracked.items():
-            # Skip if recently neutralized
-            if oid in neutralized:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (120, 120, 120), 2)
-                cv2.putText(frame, f"NEUTR {oid}", (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 120), 2)
+    def yolo_worker():
+        """Background YOLO worker: receives scaled frames and returns person detections."""
+        while not yolo_stop_event.is_set():
+            try:
+                item = yolo_input_queue.get(timeout=0.1)
+            except queue.Empty:
                 continue
 
-            area = (x2 - x1) * (y2 - y1)
-            dx = cx_obj - cx
-            dy = cy_obj - cy
-            distance = math.hypot(dx, dy)
+            if item is None:
+                break
 
-            # Score: prefer large targets near center
-            score = area - (distance * 50)
-            candidates.append((score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx, dy))
+            scaled_frame, scale_ratio, ts = item
+            person_dets = []
+            try:
+                results = model(scaled_frame, verbose=False, conf=YOLO_CONFIDENCE)
+                boxes = results[0].boxes
+                if boxes is not None:
+                    for box, cls in zip(boxes.xyxy, boxes.cls):
+                        if int(cls) == 0:
+                            x1, y1, x2, y2 = [int(v / scale_ratio) for v in box.tolist()]
+                            person_dets.append((x1, y1, x2, y2))
+            except Exception as e:
+                # Keep worker alive; surface error via empty detections.
+                print(f"❌ YOLO failed: {type(e).__name__}: {e}")
 
-        candidates.sort(reverse=True, key=lambda x: x[0])
-        target = candidates[0] if candidates else None
+            # Keep only newest result.
+            try:
+                while True:
+                    yolo_output_queue.get_nowait()
+            except queue.Empty:
+                pass
+            yolo_output_queue.put((ts, person_dets))
 
-        # Draw frame center
-        cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)
+    # Open camera
+    try:
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            print("❌ Cannot open camera")
+            return
 
-        send_fire = False
+        # Reduce camera lag accumulation where backend supports it.
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        try:
+            cap.set(cv2.CAP_PROP_FPS, 30)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"❌ Failed to open camera: {e}")
+        return
 
-        if target:
-            # TARGET ACQUISITION MODE
-            score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
-            distance = math.hypot(dx_px, dy_px)
-            aligned = distance <= CENTER_TOLERANCE
+    print("✅ Turret started - camera open, GUI mode enabled")
 
-            # Draw target
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.circle(frame, (cx_obj, cy_obj), 4, (0, 255, 0), -1)
-            cv2.line(frame, (cx, cy), (cx_obj, cy_obj), (255, 0, 0), 1)
-            cv2.putText(frame, f"ID:{oid} | dx={int(dx_px)} dy={int(dy_px)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 255, 0), 2)
-            cv2.putText(frame, "MODE: TARGETING", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 255, 0), 2)
+    worker_thread = threading.Thread(target=yolo_worker, daemon=True)
+    worker_thread.start()
 
-            # convert pixel offsets to degrees for servos
-            dx_deg = dx_px * DEG_PER_PIXEL
-            dy_deg = dy_px * DEG_PER_PIXEL
+    frame_count = 0
+    error_count = 0
+    max_consecutive_errors = 5
+    last_yolo_submit = 0.0
+    manual_fire_requested = False
 
-            # Note: Fire condition checked later after key press detection
+    # Main loop
+    while True:
+        try:
+            # Periodic memory cleanup
+            if frame_count % 300 == 0:
+                gc.collect()
 
-            # Reset surveillance on target acquisition to avoid timing jump
-            surveillance_angle = 0.0
-            surveillance_direction = 1
-            last_surveillance_update = time.time()
-        else:
-            # SURVEILLANCE MODE - sweep at constant degrees/second
-            time.sleep(10 / 1000)  # small delay to reduce CPU load
-            cv2.putText(frame, "MODE: SURVEILLANCE", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 165, 255), 2)
+            # Read frame
+            ret, frame = cap.read()
+            if not ret:
+                print("❌ Failed to read frame")
+                break
+            if frame is None or frame.size == 0:
+                continue
 
-            time_delta = time.time() - last_surveillance_update
-            if time_delta > 0:
-                surveillance_angle += SURVEILLANCE_SPEED * time_delta * surveillance_direction
-                if surveillance_angle >= surveillance_range:
-                    surveillance_angle = surveillance_range
-                    surveillance_direction = -1
-                elif surveillance_angle <= -surveillance_range:
-                    surveillance_angle = -surveillance_range
-                    surveillance_direction = 1
-                last_surveillance_update = time.time()
+            frame_count += 1
+            error_count = 0
 
-            dx_deg = surveillance_angle
+            h, w = frame.shape[:2]
+            cx, cy = w // 2, h // 2
+            now = time.time()
+
+            # Submit frame to YOLO worker at fixed cadence (non-blocking).
+            if now - last_yolo_submit >= YOLO_INTERVAL:
+                try:
+                    scale_ratio = FRAME_SCALE_WIDTH / w
+                    scaled_frame = cv2.resize(frame, (FRAME_SCALE_WIDTH, int(h * scale_ratio)))
+                    payload = (scaled_frame, scale_ratio, now)
+
+                    # Replace queued stale input with newest frame.
+                    try:
+                        while True:
+                            yolo_input_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    yolo_input_queue.put_nowait(payload)
+                    last_yolo_submit = now
+                except queue.Full:
+                    pass
+                except Exception as e:
+                    print(f"⚠️ YOLO submit error: {type(e).__name__}: {e}")
+
+            # Consume newest YOLO result (if available) and cache it.
+            try:
+                while True:
+                    ts, dets = yolo_output_queue.get_nowait()
+                    latest_detection_ts = ts
+                    latest_detections = dets
+            except queue.Empty:
+                pass
+
+            detections = latest_detections
+
+            # Update tracker with cached/latest detections.
+            try:
+                tracked = tracker.update(detections)
+            except Exception as e:
+                print(f"❌ Tracker error: {e}")
+                tracked = {}
+
+            # Clear old neutralized targets
+            try:
+                if now - last_clear > CLEAR_INTERVAL:
+                    neutralized = {oid: ts for oid, ts in neutralized.items() if now - ts < CLEAR_INTERVAL}
+                    last_clear = now
+            except Exception as e:
+                print(f"⚠️ Clear error: {e}")
+
+            # Find best target
+            candidates = []
+            try:
+                for oid, (x1, y1, x2, y2, cx_obj, cy_obj) in tracked.items():
+                    if oid in neutralized:
+                        continue
+                    area = (x2 - x1) * (y2 - y1)
+                    dx = cx_obj - cx
+                    dy = cy_obj - cy
+                    distance = math.hypot(dx, dy)
+                    score = area - (distance * 50)
+                    candidates.append((score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx, dy))
+            except Exception as e:
+                print(f"⚠️ Candidate error: {e}")
+
+            candidates.sort(reverse=True, key=lambda x: x[0])
+            target = candidates[0] if candidates else None
+
+            # Calculate aim angles
+            send_fire = False
+            dx_deg = 0.0
             dy_deg = 0.0
 
-            cv2.putText(frame, f"Sweep: {int(surveillance_angle):+d}°", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 165, 255), 2)
+            if target:
+                try:
+                    score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
+                    distance = math.hypot(dx_px, dy_px)
+                    aligned = distance <= CENTER_TOLERANCE
 
-        # Display frame and check for key press
-        cv2.imshow('turret', frame)
-        key = cv2.waitKey(1) & 0xFF
+                    dx_deg = dx_px * DEG_PER_PIXEL
+                    dy_deg = dy_px * DEG_PER_PIXEL
 
-        if key == ord('q'):
-            print("operator requested shutdown.......")
-            time.sleep(3)
-            print("Terminating program.")
-            break
+                    surveillance_angle = 0.0
+                    surveillance_direction = 1
+                    last_surveillance_update = time.time()
 
-        # Fire logic (only if we have a target)
-        if target:
-            score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
-            distance = math.hypot(dx_px, dy_px)
-            aligned = distance <= CENTER_TOLERANCE
+                    if (aligned or manual_fire_requested) and (now - last_fire) > FIRE_COOLDOWN:
+                        send_fire = True
+                        last_fire = now
+                        neutralized[oid] = now
+                        if manual_fire_requested and not aligned:
+                            print(f"🎯 MANUAL FIRE at target ID:{oid}")
+                        else:
+                            print(f"🎯 AUTO-FIRE at target ID:{oid}")
+                        manual_fire_requested = False
+                except Exception as e:
+                    print(f"⚠️ Target error: {e}")
+            else:
+                try:
+                    time.sleep(10 / 1000)
+                    time_delta = time.time() - last_surveillance_update
+                    if time_delta > 0:
+                        surveillance_angle += SURVEILLANCE_SPEED * time_delta * surveillance_direction
+                        if surveillance_angle >= surveillance_range:
+                            surveillance_angle = surveillance_range
+                            surveillance_direction = -1
+                        elif surveillance_angle <= -surveillance_range:
+                            surveillance_angle = -surveillance_range
+                            surveillance_direction = 1
+                        last_surveillance_update = time.time()
 
-            # Fire when manually triggered with F key OR automatically when aligned
-            if (key == ord('f') or aligned) and (now - last_fire) > FIRE_COOLDOWN:
-                send_fire = True
-                last_fire = now
-                neutralized[oid] = now
-                print(f"🎯 MANUAL FIRE at target ID:{oid}")
+                    dx_deg = surveillance_angle
+                    dy_deg = 0.0
+                except Exception as e:
+                    print(f"⚠️ Surveillance error: {e}")
 
-        # send aim in degrees (Arduino expects degrees)
-        ser.send_aim(int(round(dx_deg)), int(round(dy_deg)), send_fire)
+            # Display camera window with detections (always on)
+            try:
+                cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)
+                if target:
+                    _, _, _, _, _, _, cx_obj, cy_obj, _, _ = target
+                    cv2.circle(frame, (cx_obj, cy_obj), 5, (0, 255, 0), -1)
+                # Draw all tracked objects lightly
+                for oid, (x1, y1, x2, y2, cx_obj, cy_obj) in tracked.items():
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (120, 120, 120), 1)
+                    cv2.putText(frame, f"T:{oid}", (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
 
-    ser.close()
-    cap.release()
-    cv2.destroyAllWindows()
+                # Highlight selected target
+                if target:
+                    score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"ID:{oid}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # Lightweight status overlay
+                cv2.putText(
+                    frame,
+                    f"Tracked:{len(tracked)} CachedDet:{len(latest_detections)}",
+                    (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+                cv2.imshow("Turret Camera", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("f"):
+                    manual_fire_requested = True
+                if key == ord("q"):
+                    break
+            except Exception:
+                pass
+
+            # Send serial command
+            try:
+                current_time = time.time()
+                if current_time - last_serial_send >= SERIAL_INTERVAL:
+                    ser.send_aim(int(round(dx_deg)), int(round(dy_deg)), send_fire)
+                    last_serial_send = current_time
+            except Exception as e:
+                print(f"❌ Serial error: {e}")
+
+            # Log status every 5 seconds
+            if now - last_status_log >= STATUS_LOG_INTERVAL:
+                fire_status = "1" if send_fire else "0"
+                age_ms = int((now - latest_detection_ts) * 1000) if latest_detection_ts > 0 else -1
+                print(
+                    f"[status] targets={len(tracked)} cached_det={len(latest_detections)} "
+                    f"det_age_ms={age_ms} fire={fire_status} "
+                    f"aim=({int(round(dx_deg))},{int(round(dy_deg))}) frame={frame_count}"
+                )
+                last_status_log = now
+
+        except Exception as e:
+            error_count += 1
+            print(f"❌ Error (#{error_count}): {e}")
+            if error_count >= max_consecutive_errors:
+                print("❌ Too many errors, exiting")
+                break
+            time.sleep(0.1)
+            continue
+
+    # Cleanup
+    try:
+        yolo_stop_event.set()
+        try:
+            yolo_input_queue.put_nowait(None)
+        except Exception:
+            pass
+        worker_thread.join(timeout=1.0)
+    except Exception:
+        pass
+
+    try:
+        ser.close()
+        cap.release()
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+
+    print("✅ Turret shutdown complete")
 
 
 if __name__ == "__main__":
-    # set `serial_port` to your Arduino COM port like `COM3` on Windows
-    run(camera_index=0, serial_port=None)
+    # Use TURRET_COM_PORT=COMx to force a specific port, otherwise auto-detect.
+    run(camera_index=0, serial_port=os.getenv("TURRET_COM_PORT", "auto"))
