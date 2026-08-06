@@ -1,37 +1,47 @@
 # python
 """
-Turret Main - Headless Version (No GUI)
-Better for testing and server environments
+Turret Headless - Network Camera + Local Servo Control
+Runs on Raspberry Pi:
+  1. Captures camera frames and streams them over TCP
+  2. Receives detection commands from laptop (dx, dy, fire)
+  3. Sends servo commands to Arduino
 """
 import time
 import math
 import cv2
 import gc
-from ultralytics import YOLO
-from src.serial_comm import SerialController
-from centroid_tracker import CentroidTracker
+import socket
+import struct
+import pickle
+import threading
+import sys
+import os
 
-CENTER_TOLERANCE = 20
-FIRE_COOLDOWN = 2.0
-CLEAR_INTERVAL = 1000.0
-SURVEILLANCE_SPEED = 15
-DEG_PER_PIXEL = 0.08
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Rate limiting to prevent serial buffer overflow
+from serial_comm import SerialController
+
+# Configuration
 SERIAL_RATE_HZ = 20
-SERIAL_INTERVAL = 1.0 / SERIAL_RATE_HZ  # ~50ms between messages
+SERIAL_INTERVAL = 1.0 / SERIAL_RATE_HZ
+
+# Network settings
+CAMERA_STREAM_PORT = 5000
+COMMAND_LISTEN_PORT = 5001
+BUFFER_SIZE = 1024
 
 
 def run_headless(camera_index=0, serial_port=None, model_path="yolov8n.pt", runtime_seconds=None):
-    """Run turret without GUI display - better for stability"""
-
-    try:
-        model = YOLO(model_path)
-        print("✅ YOLO model loaded")
-    except Exception as e:
-        print(f"❌ Failed to load YOLO model: {e}")
-        return
-
+    """
+    Run turret on Raspberry Pi:
+    - Stream camera frames over TCP port 5000
+    - Listen for servo commands over TCP port 5001
+    - Send servo commands to Arduino
+    """
+    
+    print("✅ Turret Pi Mode - Camera streaming + Command receiver")
+    
+    # Initialize serial (Arduino)
     try:
         ser = SerialController(serial_port)
         print("✅ Serial controller initialized")
@@ -39,228 +49,177 @@ def run_headless(camera_index=0, serial_port=None, model_path="yolov8n.pt", runt
         print(f"❌ Failed to initialize serial: {e}")
         return
 
+    # Open camera
     try:
-        tracker = CentroidTracker(max_disappeared=30, max_distance=120)
-        print("✅ Tracker initialized")
-    except Exception as e:
-        print(f"❌ Failed to initialize tracker: {e}")
-        return
-
-    neutralized = {}
-    last_fire = 0
-    last_clear = time.time()
-    last_serial_send = time.time()
-    last_status_print = time.time()
-
-    # Surveillance mode variables
-    surveillance_angle = 0.0
-    surveillance_direction = 1
-    last_surveillance_update = time.time()
-    surveillance_range = 90
-
-    try:
-        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(camera_index)
+        cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             print("❌ Cannot open camera")
             return
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except:
+            pass
+        try:
+            cap.set(cv2.CAP_PROP_FPS, 30)
+        except:
+            pass
         print("✅ Camera opened")
     except Exception as e:
         print(f"❌ Failed to open camera: {e}")
         return
 
-    print("✅ Turret running in HEADLESS mode — press Ctrl+C to quit\n")
-
-    frame_count = 0
-    error_count = 0
-    max_consecutive_errors = 5
+    # Shared state for servo commands
+    latest_command = {"dx": 0, "dy": 0, "fire": False}
+    command_lock = threading.Lock()
+    last_serial_send = time.time()
     start_time = time.time()
-
-    while True:
+    frame_count = 0
+    
+    # Command receiver thread
+    def command_receiver():
+        """Listen on port 5001 for servo commands from laptop."""
         try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(('0.0.0.0', COMMAND_LISTEN_PORT))
+            server.listen(1)
+            print(f"[CMD] Listening for commands on port {COMMAND_LISTEN_PORT}...")
+            
+            while True:
+                try:
+                    client, addr = server.accept()
+                    print(f"[CMD] Laptop connected from {addr}")
+                    
+                    while True:
+                        try:
+                            data = client.recv(BUFFER_SIZE)
+                            if not data:
+                                break
+                            
+                            # Parse: "dx,dy,fire\n"
+                            msg = data.decode().strip()
+                            parts = msg.split(',')
+                            if len(parts) >= 3:
+                                dx = int(parts[0])
+                                dy = int(parts[1])
+                                fire = int(parts[2]) != 0
+                                
+                                with command_lock:
+                                    latest_command["dx"] = dx
+                                    latest_command["dy"] = dy
+                                    latest_command["fire"] = fire
+                                
+                                print(f"[CMD] Received: dx={dx}, dy={dy}, fire={fire}")
+                        except Exception as e:
+                            print(f"[CMD] Client error: {e}")
+                            break
+                    client.close()
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    print(f"[CMD] Accept error: {e}")
+        finally:
+            try:
+                server.close()
+            except:
+                pass
+    
+    # Camera stream thread
+    def camera_streamer():
+        """Stream camera frames over port 5000."""
+        try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(('0.0.0.0', CAMERA_STREAM_PORT))
+            server.listen(1)
+            print(f"[CAM] Streaming camera on port {CAMERA_STREAM_PORT}...")
+            
+            while True:
+                try:
+                    client, addr = server.accept()
+                    print(f"[CAM] Laptop connected from {addr}")
+                    
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        
+                        # Serialize and send frame
+                        frame_data = pickle.dumps(frame)
+                        message = struct.pack('Q', len(frame_data)) + frame_data
+                        
+                        try:
+                            client.sendall(message)
+                        except:
+                            print("[CAM] Client disconnected")
+                            break
+                    
+                    client.close()
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    print(f"[CAM] Error: {e}")
+        finally:
+            try:
+                server.close()
+            except:
+                pass
+    
+    # Start background threads
+    cmd_thread = threading.Thread(target=command_receiver, daemon=True)
+    cam_thread = threading.Thread(target=camera_streamer, daemon=True)
+    cmd_thread.start()
+    cam_thread.start()
+    
+    print("✅ Turret running - waiting for laptop connection...")
+    print()
+    
+    # Main loop - read commands and send to Arduino
+    try:
+        while True:
             # Check runtime limit
             if runtime_seconds and (time.time() - start_time) > runtime_seconds:
                 print(f"\n✅ Runtime limit ({runtime_seconds}s) reached")
                 break
-
-            # Periodic garbage collection
-            if frame_count % 300 == 0:
-                gc.collect()
-
-            ret, frame = cap.read()
-            if not ret:
-                print("❌ Failed to read frame")
-                break
-
-            # Validate frame
-            if frame is None or frame.size == 0:
-                print("⚠️  Empty frame received")
-                continue
-
-            frame_count += 1
-            error_count = 0
-
-            h, w = frame.shape[:2]
-            cx, cy = w // 2, h // 2
-
-            # Run YOLO detection with error handling
-            try:
-                results = model(frame, verbose=False)
-                boxes = results[0].boxes
-            except Exception as e:
-                print(f"⚠️  YOLO detection failed: {e}")
-                boxes = None
-
-            # Extract person detections (class 0)
-            detections = []
-            try:
-                if boxes is not None:
-                    for box, cls in zip(boxes.xyxy, boxes.cls):
-                        if int(cls) == 0:
-                            x1, y1, x2, y2 = [int(v) for v in box]
-                            detections.append((x1, y1, x2, y2))
-            except Exception as e:
-                print(f"⚠️  Error processing detections: {e}")
-
-            # Update tracker with detections
-            try:
-                tracked = tracker.update(detections)
-            except Exception as e:
-                print(f"⚠️  Tracker update failed: {e}")
-                tracked = {}
-
-            # Periodic clear of neutralized targets
+            
+            # Send servo command to Arduino at fixed rate
             now = time.time()
-            try:
-                if now - last_clear > CLEAR_INTERVAL:
-                    neutralized = {oid: ts for oid, ts in neutralized.items() if now - ts < CLEAR_INTERVAL}
-                    last_clear = now
-            except Exception as e:
-                print(f"⚠️  Error clearing neutralized targets: {e}")
-
-            # Prioritize targets: prefer largest and near center
-            candidates = []
-            try:
-                for oid, (x1, y1, x2, y2, cx_obj, cy_obj) in tracked.items():
-                    if oid in neutralized:
-                        continue
-
-                    area = (x2 - x1) * (y2 - y1)
-                    dx = cx_obj - cx
-                    dy = cy_obj - cy
-                    distance = math.hypot(dx, dy)
-
-                    score = area - (distance * 50)
-                    candidates.append((score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx, dy))
-            except Exception as e:
-                print(f"⚠️  Error processing candidates: {e}")
-
-            candidates.sort(reverse=True, key=lambda x: x[0])
-            target = candidates[0] if candidates else None
-
-            send_fire = False
-            dx_deg = 0
-            dy_deg = 0
-
-            if target:
+            if now - last_serial_send >= SERIAL_INTERVAL:
+                with command_lock:
+                    dx = latest_command["dx"]
+                    dy = latest_command["dy"]
+                    fire = latest_command["fire"]
+                
                 try:
-                    # TARGET ACQUISITION MODE
-                    score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
-                    distance = math.hypot(dx_px, dy_px)
-                    aligned = distance <= CENTER_TOLERANCE
-
-                    # convert pixel offsets to degrees for servos
-                    dx_deg = dx_px * DEG_PER_PIXEL
-                    dy_deg = dy_px * DEG_PER_PIXEL
-
-                    # Reset surveillance on target acquisition
-                    surveillance_angle = 0.0
-                    surveillance_direction = 1
-                    last_surveillance_update = time.time()
+                    ser.send_aim(dx, dy, fire)
+                    last_serial_send = now
                 except Exception as e:
-                    print(f"⚠️  Error in target acquisition: {e}")
-            else:
-                try:
-                    # SURVEILLANCE MODE
-                    time.sleep(10 / 1000)
-
-                    time_delta = time.time() - last_surveillance_update
-                    if time_delta > 0:
-                        surveillance_angle += SURVEILLANCE_SPEED * time_delta * surveillance_direction
-                        if surveillance_angle >= surveillance_range:
-                            surveillance_angle = surveillance_range
-                            surveillance_direction = -1
-                        elif surveillance_angle <= -surveillance_range:
-                            surveillance_angle = -surveillance_range
-                            surveillance_direction = 1
-                        last_surveillance_update = time.time()
-
-                    dx_deg = surveillance_angle
-                    dy_deg = 0.0
-                except Exception as e:
-                    print(f"⚠️  Error in surveillance: {e}")
-
-            # Fire logic (only if we have a target)
-            if target:
-                try:
-                    score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
-                    distance = math.hypot(dx_px, dy_px)
-                    aligned = distance <= CENTER_TOLERANCE
-
-                    # Fire when automatically aligned (no manual fire in headless mode)
-                    if aligned and (now - last_fire) > FIRE_COOLDOWN:
-                        send_fire = True
-                        last_fire = now
-                        neutralized[oid] = now
-                        print(f"🎯 AUTO-FIRE at target ID:{oid}")
-                except Exception as e:
-                    print(f"⚠️  Error in fire logic: {e}")
-
-            # Send aim in degrees with rate limiting
-            try:
-                current_time = time.time()
-                if current_time - last_serial_send >= SERIAL_INTERVAL:
-                    ser.send_aim(int(round(dx_deg)), int(round(dy_deg)), send_fire)
-                    last_serial_send = current_time
-            except Exception as e:
-                print(f"⚠️  Error sending serial: {e}")
-
-            # Periodic status report
-            if now - last_status_print > 5.0:
-                print(f"[{frame_count:6d}] Targets: {len(tracked)} | Neutralized: {len(neutralized)} | dx={dx_deg:+6.1f}° dy={dy_deg:+6.1f}° fire={int(send_fire)}")
-                last_status_print = now
-
-        except KeyboardInterrupt:
-            print("\n\n🛑 User interrupted")
-            break
-        except Exception as e:
-            error_count += 1
-            print(f"❌ Error in main loop (#{error_count}): {e}")
-            import traceback
-            traceback.print_exc()
-
-            if error_count >= max_consecutive_errors:
-                print(f"❌ Too many errors, exiting...")
-                break
-
-            time.sleep(0.1)
-            continue
-
-    # Cleanup
-    print("\nCleaning up...", end="")
-    try:
-        ser.close()
-        cap.release()
-    except:
-        pass
-
-    print(" ✅ Done")
-    print(f"Total frames processed: {frame_count}")
+                    print(f"❌ Serial error: {e}")
+            
+            # Periodic status
+            frame_count += 1
+            if frame_count % 50 == 0:
+                with command_lock:
+                    print(f"[{frame_count:6d}] Last command: dx={latest_command['dx']:+4d} dy={latest_command['dy']:+4d} fire={int(latest_command['fire'])}")
+            
+            time.sleep(0.01)
+    
+    except KeyboardInterrupt:
+        print("\n\n🛑 User interrupted")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\nCleaning up...")
+        try:
+            ser.close()
+            cap.release()
+        except:
+            pass
+        print("✅ Done")
 
 
 if __name__ == "__main__":
-    # set `serial_port` to your Arduino COM port like `COM3` on Windows
-    # runtime_seconds: optional limit (e.g., 60 for 60 second test)
-    run_headless(camera_index=0, serial_port='COM6', runtime_seconds=None)
+    run_headless(camera_index=0, serial_port='/dev/ttyACM0', runtime_seconds=None)
 
