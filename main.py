@@ -7,6 +7,7 @@ import sys
 import os
 import threading
 import queue
+import platform
 from ultralytics import YOLO
 
 # Add parent directory to path so we can import from root
@@ -31,9 +32,16 @@ YOLO_CONFIDENCE = 0.5           # Filter low-confidence detections
 TRACKER_MAX_DISAPPEARED = 10    # Reduce tracker memory pressure
 YOLO_INTERVAL = 1.0             # YOLO cadence in seconds
 
+# Detect if running on Raspberry Pi
+IS_RASPBERRY_PI = 'arm' in platform.machine().lower()
+ENABLE_GUI = not IS_RASPBERRY_PI  # Disable GUI on Pi
 
-def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
-    """Main turret control loop with always-on GUI and async YOLO worker."""
+
+def run(camera_index=0, serial_port=None, model_path="yolov8n.pt", headless=None):
+    """Main turret control loop with optional GUI and async YOLO worker."""
+    
+    # Override headless mode if explicitly set
+    headless_mode = headless if headless is not None else IS_RASPBERRY_PI
 
     # Resolve model path relative to project root when needed.
     if not os.path.isabs(model_path):
@@ -44,18 +52,21 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
     # Initialize components
     try:
         model = YOLO(model_path)
+        print("✅ YOLO model loaded")
     except Exception as e:
         print(f"❌ Failed to load YOLO model: {e}")
         return
 
     try:
         ser = SerialController(serial_port)
+        print("✅ Serial initialized")
     except Exception as e:
         print(f"❌ Failed to initialize serial: {e}")
         return
 
     try:
         tracker = CentroidTracker(max_disappeared=TRACKER_MAX_DISAPPEARED, max_distance=120)
+        print("✅ Tracker initialized")
     except Exception as e:
         print(f"❌ Failed to initialize tracker: {e}")
         return
@@ -114,9 +125,17 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
 
     # Open camera
     try:
-        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
+        # On Raspberry Pi, use camera index 0 (should be the Pi camera module)
+        # On Windows/laptop, use CAP_DSHOW if available
+        if IS_RASPBERRY_PI:
             cap = cv2.VideoCapture(camera_index)
+            print(f"✅ Pi camera opened (index {camera_index})")
+        else:
+            cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(camera_index)
+            print(f"✅ Laptop camera opened (index {camera_index})")
+        
         if not cap.isOpened():
             print("❌ Cannot open camera")
             return
@@ -134,7 +153,10 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
         print(f"❌ Failed to open camera: {e}")
         return
 
-    print("✅ Turret started - camera open, GUI mode enabled")
+    if headless_mode:
+        print("✅ Turret started - HEADLESS mode (no GUI)")
+    else:
+        print("✅ Turret started - GUI mode enabled")
 
     worker_thread = threading.Thread(target=yolo_worker, daemon=True)
     worker_thread.start()
@@ -279,42 +301,43 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
                 except Exception as e:
                     print(f"⚠️ Surveillance error: {e}")
 
-            # Display camera window with detections (always on)
-            try:
-                cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)
-                if target:
-                    _, _, _, _, _, _, cx_obj, cy_obj, _, _ = target
-                    cv2.circle(frame, (cx_obj, cy_obj), 5, (0, 255, 0), -1)
-                # Draw all tracked objects lightly
-                for oid, (x1, y1, x2, y2, cx_obj, cy_obj) in tracked.items():
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (120, 120, 120), 1)
-                    cv2.putText(frame, f"T:{oid}", (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+            # Display camera window with detections (only if not headless)
+            if not headless_mode:
+                try:
+                    cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)
+                    if target:
+                        _, _, _, _, _, _, cx_obj, cy_obj, _, _ = target
+                        cv2.circle(frame, (cx_obj, cy_obj), 5, (0, 255, 0), -1)
+                    # Draw all tracked objects lightly
+                    for oid, (x1, y1, x2, y2, cx_obj, cy_obj) in tracked.items():
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (120, 120, 120), 1)
+                        cv2.putText(frame, f"T:{oid}", (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
 
-                # Highlight selected target
-                if target:
-                    score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame, f"ID:{oid}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    # Highlight selected target
+                    if target:
+                        score, oid, x1, y1, x2, y2, cx_obj, cy_obj, dx_px, dy_px = target
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(frame, f"ID:{oid}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                # Lightweight status overlay
-                cv2.putText(
-                    frame,
-                    f"Tracked:{len(tracked)} CachedDet:{len(latest_detections)}",
-                    (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 255),
-                    2,
-                )
+                    # Lightweight status overlay
+                    cv2.putText(
+                        frame,
+                        f"Tracked:{len(tracked)} CachedDet:{len(latest_detections)}",
+                        (10, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
 
-                cv2.imshow("Turret Camera", frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("f"):
-                    manual_fire_requested = True
-                if key == ord("q"):
-                    break
-            except Exception:
-                pass
+                    cv2.imshow("Turret Camera", frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("f"):
+                        manual_fire_requested = True
+                    if key == ord("q"):
+                        break
+                except Exception:
+                    pass
 
             # Send serial command
             try:
@@ -336,6 +359,9 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
                 )
                 last_status_log = now
 
+        except KeyboardInterrupt:
+            print("\n🛑 Interrupted by user")
+            break
         except Exception as e:
             error_count += 1
             print(f"❌ Error (#{error_count}): {e}")
@@ -359,7 +385,8 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
     try:
         ser.close()
         cap.release()
-        cv2.destroyAllWindows()
+        if not headless_mode:
+            cv2.destroyAllWindows()
     except Exception:
         pass
 
@@ -367,5 +394,21 @@ def run(camera_index=0, serial_port=None, model_path="yolov8n.pt"):
 
 
 if __name__ == "__main__":
-    # Use TURRET_COM_PORT=COMx to force a specific port, otherwise auto-detect.
-    run(camera_index=0, serial_port=os.getenv("TURRET_COM_PORT", "auto"))
+    # Detect environment and set defaults
+    headless = IS_RASPBERRY_PI
+    serial_port = os.getenv("TURRET_PORT", "auto")
+    
+    # Use TURRET_COM_PORT=COMx to force a specific port on Windows
+    if "TURRET_COM_PORT" in os.environ:
+        serial_port = os.getenv("TURRET_COM_PORT")
+    
+    # Use TURRET_HEADLESS=0 to force GUI mode even on Pi
+    if "TURRET_HEADLESS" in os.environ:
+        headless = int(os.getenv("TURRET_HEADLESS")) != 0
+    
+    print(f"System: {'Raspberry Pi' if IS_RASPBERRY_PI else 'Windows/Laptop'}")
+    print(f"Headless mode: {headless}")
+    print(f"Serial port: {serial_port}")
+    print()
+    
+    run(camera_index=0, serial_port=serial_port, model_path="yolov8n.pt", headless=headless)
