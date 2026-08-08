@@ -2,8 +2,8 @@ cat > ~/turret/src/pi_server.py << 'EOF'
 #!/usr/bin/env python3
 """
 Raspberry Pi Server - Camera Stream + Command Listener
+Uses Picamera2 for Pi camera module
 """
-import cv2
 import socket
 import struct
 import pickle
@@ -15,7 +15,7 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Try to import SerialController but don't fail if it's missing
+# Try to import SerialController but don't fail if missing
 try:
     from serial_comm import SerialController
     SERIAL_AVAILABLE = True
@@ -23,9 +23,16 @@ except Exception as e:
     print(f"⚠️  SerialController import failed: {e}")
     SERIAL_AVAILABLE = False
 
+# Import Picamera2
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️  Picamera2 not available: {e}")
+    PICAMERA2_AVAILABLE = False
+
 CAMERA_PORT = 5000
 COMMAND_PORT = 5001
-CAMERA_INDEX = 0
 SERIAL_PORT = "/dev/ttyACM0"
 
 print("=" * 60)
@@ -44,20 +51,30 @@ if SERIAL_AVAILABLE:
 else:
     print("⚠️  SerialController module not available")
 
-# Open camera
-print(f"Attempting to open camera (index {CAMERA_INDEX})...")
+# Open camera using Picamera2
+print(f"Opening Raspberry Pi Camera Module...")
+picam2 = None
 try:
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    time.sleep(1)  # Give it time to initialize
-    
-    if not cap.isOpened():
-        print("❌ Cannot open camera - isOpened() returned False")
+    if not PICAMERA2_AVAILABLE:
+        print("❌ Picamera2 not available")
         sys.exit(1)
     
-    # Try to read one frame
-    ret, frame = cap.read()
-    if not ret or frame is None:
-        print("❌ Cannot read frames from camera")
+    picam2 = Picamera2()
+    
+    camera_config = picam2.create_preview_configuration(
+        main={
+            "size": (640, 480),
+            "format": "BGR888"
+        }
+    )
+    
+    picam2.configure(camera_config)
+    picam2.start()
+    time.sleep(2)
+    
+    frame = picam2.capture_array()
+    if frame is None:
+        print("❌ Cannot read frame from camera")
         sys.exit(1)
     
     print(f"✅ Camera opened successfully")
@@ -99,8 +116,8 @@ def camera_server():
             frame_count = 0
             try:
                 while not stop_event.is_set():
-                    ret, frame = cap.read()
-                    if not ret:
+                    frame = picam2.capture_array()
+                    if frame is None:
                         print(f"[CAM] ❌ Failed to read frame")
                         break
                     
@@ -211,7 +228,8 @@ except KeyboardInterrupt:
     print("\n🛑 Shutting down...")
     stop_event.set()
     time.sleep(1)
-    cap.release()
+    if picam2:
+        picam2.stop()
     if ser:
         ser.close()
     print("✅ Shutdown complete")
